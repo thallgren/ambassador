@@ -1,7 +1,6 @@
 package edgectl
 
 import (
-	"bufio"
 	"bytes"
 	"fmt"
 	"os"
@@ -41,7 +40,7 @@ type RunInfo struct {
 func (ri *RunInfo) RunCommand(cmd *cobra.Command, args []string) error {
 	logrus.SetLevel(logrus.DebugLevel)
 
-	ri.Self = "edgectl"
+	ri.Self = os.Args[0]
 	ri.PreviewSet = cmd.Flags().Changed("preview")
 	return ri.withIntercept(func() error {
 		// TODO: Sensible signal handling such as trapping SIGINT and SIGKILL. Should
@@ -56,15 +55,41 @@ type channelWriter chan []byte
 
 func (w channelWriter) Write(p []byte) (n int, err error) {
 	w <- p
-	return len(p), nil
+	return os.Stdout.Write(p)
 }
 
-var interceptReadyMessage = []byte("starting SSH tunnel")
+func (w channelWriter) waitFor(t time.Duration, f func(data []byte) bool) bool {
+	defer func() {
+		// ensure writer accepts remaining output without blocking
+		go func() {
+			for range w {
+			}
+		}()
+	}()
+
+	timeout := time.NewTimer(t) // timeout waiting for ssh tunnel create
+	for {
+		select {
+		case <-timeout.C:
+			return false
+		case bts, ok := <-w:
+			if !ok {
+				return false
+			}
+			if f(bts) {
+				timeout.Stop()
+				return true
+			}
+		}
+	}
+}
+
+var interceptReadyMessage = []byte("starting SSH")
 
 // withIntercept runs the given function after asserting that an intercept is in place.
 func (ri *RunInfo) withIntercept(f func() error) error {
 	return ri.withConnection(func() error {
-		args := []string{"edgectl", "intercept", "add",
+		args := []string{ri.Self, "intercept", "add",
 			ri.Deployment, "--name", ri.Name, "--target", ri.TargetHost}
 		if ri.PreviewSet {
 			args = append(args, "--preview", fmt.Sprintf("%t", ri.Preview))
@@ -84,33 +109,19 @@ func (ri *RunInfo) withIntercept(f func() error) error {
 
 		// create an io.Writer that writes a message on a channel when the desired message has been received
 		ready := make(chan bool, 1)
-		out := channelWriter(make(chan []byte, 1))
+		out := channelWriter(make(chan []byte, 5))
 		go func() {
-			timeout := time.NewTimer(30 * time.Second) // timeout waiting for ssh tunnel create
-			for {
-				select {
-				case <-timeout.C:
-					ready <- false
-					return
-				case bts, ok := <-out:
-					if !ok {
-						return
-					}
-					os.Stdout.Write(bts)
-					if bytes.Contains(bts, interceptReadyMessage) {
-						ready <- true
-						timeout.Stop()
-					}
-				}
-			}
+			ready <- out.waitFor(30*time.Second, func(bts []byte) bool {
+				return bytes.Contains(bts, interceptReadyMessage)
+			})
 		}()
 
 		if logrus.IsLevelEnabled(logrus.DebugLevel) {
 			logrus.Debug(strings.Join(args, " "))
 		}
-		err, exitCode := CommandViaDaemon(args, &out)
+		err, exitCode := CommandViaDaemon(args, out)
 		if err == nil && exitCode != 0 {
-			err = fmt.Errorf("edgectl intercept add exited with %d", exitCode)
+			err = fmt.Errorf("%s intercept add exited with %d", ri.Self, exitCode)
 		}
 		if err != nil {
 			close(out) // terminates the above go routine
@@ -118,7 +129,7 @@ func (ri *RunInfo) withIntercept(f func() error) error {
 		}
 		defer func() {
 			logrus.Debugf("Removing intercept %s", ri.Name)
-			_, _ = CommandViaDaemon([]string{"edgectl", "intercept", "remove", ri.Name}, os.Stdout)
+			_, _ = CommandViaDaemon([]string{ri.Self, "intercept", "remove", ri.Name}, os.Stdout)
 		}()
 		if <-ready {
 			return f()
@@ -131,51 +142,53 @@ func (ri *RunInfo) withIntercept(f func() error) error {
 func (ri *RunInfo) withConnection(f func() error) error {
 	return ri.withDaemonRunning(func() error {
 		logrus.Debug("Connecting to daemon")
-		wasConnected := false
-		connected := make(chan bool)
+		wasConnected := true
+		connected := false
 		var err error
 
-		go func() {
-			var exitCode int
-		retryConnect:
-			for {
-				out := bytes.Buffer{}
-				err, exitCode = CommandViaDaemon([]string{"edgectl", "connect"}, &out)
-				if err == nil && exitCode != 0 {
-					err = fmt.Errorf("%s connect exited with %d", "edgectl", exitCode)
-					connected <- false
-				}
-
-				scanner := bufio.NewScanner(&out)
-				for scanner.Scan() {
-					line := scanner.Text()
+		var exitCode int
+		for i := 0; i < 10; i++ {
+			ready := make(chan bool, 1)
+			out := channelWriter(make(chan []byte, 5))
+			go func() {
+				ready <- out.waitFor(2*time.Second, func(bts []byte) bool {
+					line := string(bts)
 					switch {
 					case strings.HasPrefix(line, "Already connected"):
-						wasConnected = true
-						connected <- true
+						return true
 					case strings.HasPrefix(line, "Connected"):
-						connected <- true
-					case strings.HasPrefix(line, "Not ready"):
-						logrus.Debug("Connection not ready. Retrying...")
-						time.Sleep(time.Second)
-						continue retryConnect
+						wasConnected = false
+						return true
 					}
-					fmt.Println(line)
-				}
+					// Not ready
+					wasConnected = false
+					return false
+				})
+			}()
+
+			err, exitCode = CommandViaDaemon([]string{ri.Self, "connect"}, out)
+			if err == nil && exitCode != 0 {
+				err = fmt.Errorf("%s connect exited with %d", ri.Self, exitCode)
 				break
 			}
-		}()
-
-		if <-connected {
-			if !wasConnected {
-				defer func() {
-					logrus.Debug("Disconnecting from daemon")
-					_, _ = CommandViaDaemon([]string{"edgectl", "disconnect"}, os.Stdout)
-				}()
+			if <-ready {
+				connected = true
+				break
 			}
-			err = f()
+			logrus.Debug("Connection not ready. Retrying...")
 		}
-		return err
+		if !connected {
+			return fmt.Errorf("timeout trying to connect")
+		}
+		if !wasConnected {
+			defer func() {
+				logrus.Debug("Disconnecting from daemon")
+				_, _ = CommandViaDaemon([]string{ri.Self, "disconnect"}, os.Stdout)
+			}()
+		}
+		// Allow time to connect to traffic manager
+		time.Sleep(3 * time.Second)
+		return f()
 	})
 }
 
